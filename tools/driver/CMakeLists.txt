@@ -9,6 +9,11 @@
 # Keep symbols for JIT resolution
 set(LLVM_NO_DEAD_STRIP 1)
 
+if(MSVC)
+  set(CLING_WINDOWS_EMUTLS_LIBRARY "" CACHE FILEPATH
+    "Experimental compiler-rt emutls library for Windows Cling")
+endif()
+
 set(LLVM_LINK_COMPONENTS Support)
 if(BUILD_SHARED_LIBS)
   set(LIBS
@@ -53,7 +58,11 @@ if(MSVC)
   # Compiler added symbols for static variables. NOT for VStudio < 2015
   set(cling_exports ${cling_exports} _Init_thread_abort _Init_thread_epoch
     _Init_thread_footer _Init_thread_header _tls_index
+    __cling_get_init_thread_epoch
   )
+  if(CLING_WINDOWS_EMUTLS_LIBRARY)
+    list(APPEND cling_exports __emutls_get_address)
+  endif()
 
   if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     # new/delete variants needed when linking to static msvc runtime (esp. Debug)
@@ -105,6 +114,21 @@ if(MSVC)
 endif(MSVC)
 
 target_link_libraries(cling PUBLIC ${LIBS})
+
+if(MSVC AND CLING_WINDOWS_EMUTLS_LIBRARY)
+  # Diagnostic prototype only: provide __emutls_get_address after enabling
+  # emulated TLS. The final runtime ownership and integration are unresolved.
+  # Build the one-object archive from a VS Developer PowerShell as follows
+  # (use /MDd instead of /MD when building Cling in Debug mode):
+  #   $compilerRt = "C:\path\to\llvm-project\compiler-rt"
+  #   cl /nologo /c /GS- /MD /TC /I "$compilerRt\lib\builtins" `
+  #     "$compilerRt\lib\builtins\emutls.c" `
+  #     "/Fo:$env:TEMP\emutls_nogs.obj"
+  #   lib /nologo "/OUT:$env:TEMP\emutls_nogs.lib" `
+  #     "$env:TEMP\emutls_nogs.obj"
+  target_link_libraries(cling PRIVATE
+    "${CLING_WINDOWS_EMUTLS_LIBRARY}")
+endif()
 
 install(TARGETS cling
   RUNTIME DESTINATION bin)

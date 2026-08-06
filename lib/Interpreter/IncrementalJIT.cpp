@@ -44,6 +44,14 @@ using namespace llvm;
 using namespace llvm::jitlink;
 using namespace llvm::orc;
 
+#ifdef _WIN32
+extern "C" __declspec(thread) int _Init_thread_epoch;
+
+extern "C" int* __cling_get_init_thread_epoch() {
+  return &_Init_thread_epoch;
+}
+#endif
+
 namespace {
   static SymbolMap GetListOfPerfSymbols(const LLJIT& Jit) {
     // ORC's perf support plugin looks up these runtime entry points through the
@@ -459,7 +467,7 @@ CreateTargetMachine(const clang::CompilerInstance& CI, bool JITLink) {
 
   JTMB.setCodeGenOptLevel(OptLevel);
 #ifdef _WIN32
-  JTMB.getOptions().EmulatedTLS = false;
+  JTMB.getOptions().EmulatedTLS = true;
 #endif // _WIN32
 
 #if defined(__powerpc64__) || defined(__PPC64__)

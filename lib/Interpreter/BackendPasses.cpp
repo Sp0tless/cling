@@ -13,15 +13,18 @@
 
 #include "cling/Utils/Platform.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/InlineCost.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/AlwaysInliner.h"
@@ -43,6 +46,41 @@ llvm::PassPluginLibraryInfo getAdaptiveCppPluginInfo();
 using namespace cling;
 using namespace clang;
 using namespace llvm;
+
+#ifdef _WIN32
+namespace {
+  class RewriteMSVCRuntimeTLSPass
+      : public PassInfoMixin<RewriteMSVCRuntimeTLSPass> {
+  public:
+    PreservedAnalyses run(Module& M, ModuleAnalysisManager&) {
+      GlobalVariable* Epoch = M.getNamedGlobal("_Init_thread_epoch");
+      if (!Epoch)
+        return PreservedAnalyses::all();
+
+      FunctionCallee Getter = M.getOrInsertFunction(
+          "__cling_get_init_thread_epoch",
+          FunctionType::get(Epoch->getType(), false));
+
+      SmallVector<Use*, 4> Uses;
+      for (Use& U : Epoch->uses())
+        Uses.push_back(&U);
+
+      for (Use* U : Uses) {
+        Instruction* I = dyn_cast<Instruction>(U->getUser());
+        if (!I)
+          report_fatal_error(
+              "unsupported constant use of MSVC's _Init_thread_epoch");
+
+        IRBuilder<> Builder(I);
+        U->set(Builder.CreateCall(Getter));
+      }
+
+      Epoch->eraseFromParent();
+      return PreservedAnalyses::none();
+    }
+  };
+} // namespace
+#endif
 
 namespace {
   class UniqueInitFunctionNamePass
@@ -464,6 +502,10 @@ void BackendPasses::CreatePasses(int OptLevel, llvm::ModulePassManager& MPM,
                                  llvm::ModuleAnalysisManager& MAM,
                                  PassInstrumentationCallbacks& PIC,
                                  StandardInstrumentations& SI) {
+
+#ifdef _WIN32
+  MPM.addPass(RewriteMSVCRuntimeTLSPass());
+#endif
 
   // TODO: Remove this pass once we upgrade past LLVM 19 that includes the fix.
   MPM.addPass(WorkAroundConstructorPriorityBugPass());
