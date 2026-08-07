@@ -1,0 +1,331 @@
+name: Windows emulated TLS prototype comparison
+run-name: Cling Windows emutls - ${{ inputs.experiment_ref }} vs ${{ inputs.baseline_ref }}
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment_ref:
+        description: Ref in Sp0tless/cling to test
+        required: true
+        type: string
+        default: cling-windows-emutls
+      baseline_ref:
+        description: Ref in root-project/cling to use as the baseline
+        required: true
+        type: string
+        default: 1807a1e6f8819029e0931e8c829de794db60f71f
+      llvm_ref:
+        description: Ref in root-project/llvm-project to build against
+        required: true
+        type: string
+        default: aa098cfc7a481654d6e2eb162b7af394f542fcf5
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.experiment_ref }}-${{ inputs.baseline_ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: ${{ matrix.label }}
+    runs-on: windows-2022
+    timeout-minutes: 240
+    continue-on-error: ${{ matrix.allow_failure }}
+    env:
+      CL: /utf-8
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Emutls prototype
+            artifact: experiment
+            repository: ${{ github.repository }}
+            ref: ${{ inputs.experiment_ref }}
+            prototype: true
+            allow_failure: false
+          - label: Unmodified upstream baseline
+            artifact: baseline
+            repository: root-project/cling
+            ref: ${{ inputs.baseline_ref }}
+            prototype: false
+            allow_failure: true
+
+    steps:
+      - name: Checkout test harness
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ github.repository }}
+          ref: master
+          path: harness
+          persist-credentials: false
+          sparse-checkout: .ci/windows-emutls
+
+      - name: Checkout Cling source under test
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: cling-source
+          persist-credentials: false
+
+      - name: Checkout LLVM source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: root-project/llvm-project
+          ref: ${{ inputs.llvm_ref }}
+          path: llvm-source
+          persist-credentials: false
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Record source metadata
+        shell: pwsh
+        run: |
+          $artifactDirectory = "artifacts/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force $artifactDirectory | Out-Null
+          $clingCommit = git -C cling-source rev-parse HEAD
+          $llvmCommit = git -C llvm-source rev-parse HEAD
+          @"
+          label: ${{ matrix.label }}
+          cling-repository: ${{ matrix.repository }}
+          cling-ref: ${{ matrix.ref }}
+          cling-commit: $clingCommit
+          llvm-ref: ${{ inputs.llvm_ref }}
+          llvm-commit: $llvmCommit
+          runner: ${{ runner.os }} ${{ runner.arch }}
+          "@ | Set-Content "$artifactDirectory/metadata.txt" -Encoding utf8NoBOM
+
+      - name: Build no-GS emutls archive
+        if: matrix.prototype
+        shell: pwsh
+        run: |
+          $supportDirectory = "build-support/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force $supportDirectory | Out-Null
+          $supportDirectory = (Resolve-Path $supportDirectory).Path
+          $builtinsDirectory = (Resolve-Path "llvm-source/compiler-rt/lib/builtins").Path
+          $emutlsSource = Join-Path $builtinsDirectory "emutls.c"
+          $emutlsObject = Join-Path $supportDirectory "emutls_nogs.obj"
+          $emutlsLibrary = Join-Path $supportDirectory "emutls_nogs.lib"
+
+          & cl.exe /nologo /c /GS- /MD /TC /I $builtinsDirectory `
+            $emutlsSource "/Fo$emutlsObject"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & lib.exe /nologo "/OUT:$emutlsLibrary" $emutlsObject
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure Cling
+        shell: pwsh
+        run: |
+          $clingSource = (Resolve-Path cling-source).Path.Replace('\', '/')
+          $arguments = @(
+            '-S', 'llvm-source/llvm',
+            '-B', 'build',
+            '-G', 'Ninja',
+            '-DCMAKE_BUILD_TYPE=Release',
+            '-DLLVM_EXTERNAL_PROJECTS=cling',
+            "-DLLVM_EXTERNAL_CLING_SOURCE_DIR=$clingSource",
+            '-DLLVM_ENABLE_PROJECTS=clang',
+            '-DLLVM_TARGETS_TO_BUILD=X86',
+            '-DLLVM_ENABLE_ASSERTIONS=ON',
+            '-DLLVM_INCLUDE_BENCHMARKS=OFF',
+            '-DLLVM_INCLUDE_DOCS=OFF',
+            '-DLLVM_INCLUDE_EXAMPLES=OFF',
+            '-DLLVM_INCLUDE_TESTS=OFF',
+            '-DLLVM_ENABLE_LIBEDIT=OFF',
+            '-DLLVM_ENABLE_TERMINFO=OFF',
+            '-DCLANG_ENABLE_ARCMT=OFF',
+            '-DCLANG_ENABLE_STATIC_ANALYZER=OFF',
+            '-DCLING_INCLUDE_TESTS=ON'
+          )
+          if ('${{ matrix.prototype }}' -eq 'true') {
+            $emutlsLibrary = (Resolve-Path `
+              'build-support/${{ matrix.artifact }}/emutls_nogs.lib').Path.Replace('\', '/')
+            $arguments += "-DCLING_WINDOWS_EMUTLS_LIBRARY=$emutlsLibrary"
+          }
+
+          & cmake @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Cling
+        run: >-
+          cmake --build build
+          --target cling clang-resource-headers
+          --parallel
+
+      - name: Validate Cling runtime resources
+        shell: pwsh
+        run: |
+          $versionFile = Get-Content llvm-source/cmake/Modules/LLVMVersion.cmake
+          $majorLine = $versionFile | Select-String 'set\(LLVM_VERSION_MAJOR ([0-9]+)\)'
+          if (-not $majorLine) { throw 'Could not determine LLVM major version' }
+          $major = $majorLine.Matches[0].Groups[1].Value
+
+          $resourceDirectory = "build/lib/clang/$major/include"
+          $compileData = "build/tools/cling/lib/Interpreter/cling-compiledata.h"
+          foreach ($path in @($resourceDirectory, $compileData)) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Required Cling runtime resource was not produced: $path"
+            }
+          }
+
+          $clingInclude = (Resolve-Path 'cling-source/include').Path.Replace('\', '/')
+          $compileDataText = Get-Content -LiteralPath $compileData -Raw
+          if (-not $compileDataText.Contains($clingInclude)) {
+            throw "Cling runtime include path is missing from $compileData"
+          }
+
+          Write-Host "Clang resource directory: $resourceDirectory"
+          Write-Host "Cling runtime include path: $clingInclude"
+
+      - name: Run emutls experiment
+        shell: pwsh
+        run: >-
+          ./harness/.ci/windows-emutls/run-test.ps1
+          -Cling build/bin/cling.exe
+          -TestFile harness/.ci/windows-emutls/emutls_prototype.C
+          -OutputDirectory artifacts/${{ matrix.artifact }}
+          -RunLabel '${{ matrix.label }}'
+          -TimeoutSeconds 60
+
+      - name: Stage runnable Cling bundle
+        if: always()
+        shell: pwsh
+        run: |
+          $cling = "build/bin/cling.exe"
+          if (-not (Test-Path -LiteralPath $cling)) {
+            Write-Warning "Cling was not built; skipping runnable bundle"
+            exit 0
+          }
+
+          $versionFile = Get-Content llvm-source/cmake/Modules/LLVMVersion.cmake
+          $majorLine = $versionFile | Select-String 'set\(LLVM_VERSION_MAJOR ([0-9]+)\)'
+          if (-not $majorLine) { throw 'Could not determine LLVM major version' }
+          $major = $majorLine.Matches[0].Groups[1].Value
+
+          $resourceDirectory = "build/lib/clang/$major"
+          $resourceHeaders = "$resourceDirectory/include"
+          $clingHeaders = "cling-source/include/cling"
+          $generatedOptions =
+            "build/tools/cling/include/cling/Interpreter/ClingOptions.inc"
+          foreach ($path in @(
+            $cling, $resourceHeaders, $clingHeaders, $generatedOptions
+          )) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Required runnable bundle component is missing: $path"
+            }
+          }
+
+          $bundleRoot =
+            "bundles/${{ matrix.artifact }}/cling-windows-x86_64"
+          New-Item -ItemType Directory -Force "$bundleRoot/bin" | Out-Null
+          New-Item -ItemType Directory -Force "$bundleRoot/include" | Out-Null
+          New-Item -ItemType Directory -Force "$bundleRoot/lib/clang" | Out-Null
+          New-Item -ItemType Directory -Force "$bundleRoot/licenses" | Out-Null
+
+          Copy-Item -LiteralPath $cling -Destination "$bundleRoot/bin"
+          Copy-Item -LiteralPath $resourceDirectory `
+            -Destination "$bundleRoot/lib/clang" -Recurse
+          Copy-Item -LiteralPath $clingHeaders `
+            -Destination "$bundleRoot/include" -Recurse
+          Copy-Item -LiteralPath $generatedOptions -Destination `
+            "$bundleRoot/include/cling/Interpreter/ClingOptions.inc" -Force
+          Copy-Item -LiteralPath "harness/.ci/windows-emutls" `
+            -Destination "$bundleRoot/tests" -Recurse
+          Copy-Item -LiteralPath "cling-source/LICENSE.TXT" `
+            -Destination "$bundleRoot/licenses/cling-LICENSE.txt"
+          Copy-Item -LiteralPath "llvm-source/llvm/LICENSE.TXT" `
+            -Destination "$bundleRoot/licenses/llvm-LICENSE.txt"
+          Copy-Item -LiteralPath "llvm-source/clang/LICENSE.TXT" `
+            -Destination "$bundleRoot/licenses/clang-LICENSE.txt"
+          Copy-Item -LiteralPath "artifacts/${{ matrix.artifact }}/metadata.txt" `
+            -Destination "$bundleRoot/build-metadata.txt"
+
+          @'
+          [CmdletBinding()]
+          param(
+            [Parameter(ValueFromRemainingArguments = $true)]
+            [string[]]$ClingArguments
+          )
+
+          $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+          & "$root/bin/cling.exe" "-I$root/include" @ClingArguments
+          exit $LASTEXITCODE
+          '@ | Set-Content "$bundleRoot/run-cling.ps1" -Encoding utf8NoBOM
+
+          @'
+          [CmdletBinding()]
+          param(
+            [ValidateRange(1, 600)]
+            [int]$TimeoutSeconds = 60
+          )
+
+          $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+          & "$root/tests/run-test.ps1" `
+            -Cling "$root/bin/cling.exe" `
+            -ClingArguments "-I$root/include" `
+            -TestFile "$root/tests/emutls_prototype.C" `
+            -OutputDirectory "$root/results" `
+            -RunLabel "Downloaded GitHub Actions bundle" `
+            -TimeoutSeconds $TimeoutSeconds
+          exit $LASTEXITCODE
+          '@ | Set-Content "$bundleRoot/run-test.ps1" -Encoding utf8NoBOM
+
+          @(
+            '# Windows Cling emulated TLS experiment bundle'
+            ''
+            'This is a Release build from a diagnostic workflow, not an official Cling release.'
+            'Use Windows x64 with the Visual Studio 2022 C++ workload and Windows SDK installed.'
+            ''
+            'Interactive Cling:'
+            '  ./run-cling.ps1'
+            ''
+            'Run the included emulated TLS experiment:'
+            '  ./run-test.ps1'
+            ''
+            'Clang resource headers and the generated Cling option header are included.'
+            'The wrapper adds the bundled Cling headers because build-time paths are not portable.'
+            'Debug symbols are not included.'
+          ) | Set-Content "$bundleRoot/README.md" -Encoding utf8NoBOM
+
+          & dumpbin.exe /dependents $cling |
+            Set-Content "$bundleRoot/dependencies.txt" -Encoding utf8NoBOM
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $hashTargets = @(
+            "$bundleRoot/bin/cling.exe",
+            "$bundleRoot/include/cling/Interpreter/ClingOptions.inc"
+          )
+          $hashLines = foreach ($path in $hashTargets) {
+            $hash = Get-FileHash -LiteralPath $path -Algorithm SHA256
+            $relative = [IO.Path]::GetRelativePath($bundleRoot, $path)
+            "$($hash.Hash.ToLowerInvariant())  $($relative.Replace('\', '/'))"
+          }
+          $hashLines | Set-Content "$bundleRoot/SHA256SUMS.txt" -Encoding ascii
+
+      - name: Upload transcripts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cling-windows-emutls-${{ matrix.artifact }}-${{ github.run_id }}
+          path: |
+            artifacts/${{ matrix.artifact }}/*.md
+            artifacts/${{ matrix.artifact }}/*.txt
+            artifacts/${{ matrix.artifact }}/*.log
+          retention-days: 90
+
+      - name: Upload runnable bundle
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cling-windows-bundle-${{ matrix.artifact }}-${{ github.run_id }}
+          path: bundles/${{ matrix.artifact }}/
+          if-no-files-found: ignore
+          retention-days: 30

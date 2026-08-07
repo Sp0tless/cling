@@ -1,9 +1,6 @@
 name: Cling Build and Test
 
 on:
-  push:
-    paths:
-      - '**'
   workflow_dispatch:
 
 jobs:
